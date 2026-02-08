@@ -396,7 +396,7 @@ const ALLOWED_SENDTO_CODES = new Set([
   // Movement / sync
   'pos', 'move', 'velocity', 'face', 'anim', 'skin',
   // Character sync (identity, position, sprite, events)
-  'whois', 'info', 'char', 'event',
+  'whois', 'info', 'char', 'skin', 'event',
   // Trade system
   'trade/request', 'trade/accept', 'trade/decline', 'trade/cancel',
   'trade/offer', 'trade/lock', 'trade/unlock', 'trade/confirm',
@@ -404,9 +404,10 @@ const ALLOWED_SENDTO_CODES = new Set([
   // Party
   'party/invite', 'party/accept', 'party/decline',
   'party/kick', 'party/leave', 'party/update',
+  'partyAsk', 'partyJoin', 'partyFail', 'partyWhois',
   // Battle
   'battle/invite', 'battle/accept', 'battle/decline',
-  'battle/action', 'battle/result', 'battle/update',
+  'battle', 'battle/action', 'battle/result', 'battle/update',
   // Emotes / social
   'emote', 'balloon', 'typing', 'directCombatStatus',
   // Player interaction
@@ -585,7 +586,15 @@ function handleSendto(ws, msg) {
   }
 
   // Find target connection
-  const targetConn = global.connections?.get(targetUser);
+  let targetConn = global.connections?.get(targetUser);
+  if (!targetConn && global.connections) {
+    for (const conn of global.connections.values()) {
+      if (conn?.username && conn.username === targetUser) {
+        targetConn = conn;
+        break;
+      }
+    }
+  }
   
   if (!targetConn || targetConn.readyState !== 1) {
     logger.debug('HANDLER', `Sendto target offline: ${targetUser}`, { userId });
