@@ -1,22 +1,21 @@
 /*:
  * @target MZ
- * @plugindesc [ATB v3.0] Movement — Idle wander & post-battle return
+ * @plugindesc [ATB v3.0] Enemy Runtime — Idle wander, telegraph AI, reposition, escape
  * @author Hyaku no Sekai
  * @orderAfter ATB_SpriteExtension
  *
  * @help
  * ============================================================================
- * ATB_Movement v3.0 — Enemy Idle Wander & Post-Battle Return
+ * ATB_EnemyRuntime v3.0 — Enemy Movement + AI Runtime
  * ============================================================================
  *
- * v3.0 CHANGES:
- * - Enemies NO LONGER chase players. They stay near their home position
- *   with a subtle idle wander (small random shuffle at random intervals).
- * - Only skills with knockback/pull/repositioning effects move battlers.
- * - "Move" command removed from actor menu entirely.
- * - Escape command uses party-wide gauge fill.
- * - After battle ends, survivors run back to their entry positions
- *   on the map, THEN the battle scene transitions to the overworld.
+ * Combines:
+ *  - Enemy idle wander (no chasing)
+ *  - Knockback & pull skill repositioning
+ *  - Escape vote handling
+ *  - Enemy ATB AI + telegraph warnings
+ *
+ * This is a consolidation of ATB_Movement + ATB_EnemyAI.
  */
 
 (() => {
@@ -38,6 +37,12 @@
     this._wanderProgress = 0;
     this._wanderStartX = 0;
     this._wanderStartY = 0;
+
+    this._telegraphActive = false;
+    this._telegraphSkill = null;
+    this._telegraphTarget = null;
+    this._telegraphTimer = 0;
+    this._telegraphTimerMax = 0;
   };
 
   Game_Enemy.prototype._randomWanderDelay = function() {
@@ -91,21 +96,6 @@
       const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
       this._battleX = this._wanderStartX + (this._wanderTargetX - this._wanderStartX) * ease;
       this._battleY = this._wanderStartY + (this._wanderTargetY - this._wanderStartY) * ease;
-    }
-  };
-
-  // Hook into BattleManager update to tick enemy wander
-  const _BM_update_mv = BattleManager.update;
-  BattleManager.update = function(timeActive) {
-    _BM_update_mv.call(this, timeActive);
-
-    if (this._phase === "battleEnd" || this._phase === "init" || this._phase === "start") return;
-
-    // Update idle wander for all enemies
-    for (const enemy of $gameTroop.aliveMembers()) {
-      if (enemy && enemy.updateIdleWander) {
-        enemy.updateIdleWander();
-      }
     }
   };
 
@@ -199,110 +189,141 @@
   };
 
   // ========================================================================
-  // POST-BATTLE RETURN — Survivors run back to entry positions
+  // ENEMY ATB DECISION — Pick skill + target when gauge is full
   // ========================================================================
 
-  const _BM_processVictory = BattleManager.processVictory;
-  BattleManager.processVictory = function() {
-    // Start the return-to-entry animation before ending battle
-    this._postBattleReturning = true;
-    this._postBattleTimer = 0;
-    this._postBattlePhase = "returning"; // "returning" then "done"
+  BattleManager._updateEnemyAI = function() {
+    for (const enemy of $gameTroop.aliveMembers()) {
+      if (!enemy) continue;
 
-    // Record current positions and entry positions for alive party members
-    this._returnData = [];
-    for (const actor of $gameParty.aliveMembers()) {
-      this._returnData.push({
-        battler: actor,
-        startX: actor._battleX,
-        startY: actor._battleY,
-        targetX: actor._entryX,
-        targetY: actor._entryY,
-      });
-    }
-  };
-
-  const _BM_updateBattleEnd = BattleManager.updateBattleEnd;
-  BattleManager.updateBattleEnd = function() {
-    if (this._postBattleReturning) {
-      this._updatePostBattleReturn();
-      return;
-    }
-    _BM_updateBattleEnd.call(this);
-  };
-
-  BattleManager._updatePostBattleReturn = function() {
-    this._postBattleTimer++;
-
-    const duration = 60; // 1 second to run back
-    const t = Math.min(this._postBattleTimer / duration, 1.0);
-
-    // Ease-out
-    const ease = 1 - Math.pow(1 - t, 2);
-
-    let allDone = true;
-    for (const data of this._returnData) {
-      const b = data.battler;
-      if (!b) continue;
-
-      b._battleX = data.startX + (data.targetX - data.startX) * ease;
-      b._battleY = data.startY + (data.targetY - data.startY) * ease;
-
-      if (t < 1.0) allDone = false;
-    }
-
-    // Tell sprites to play walking animation during return
-    if (t < 1.0) {
-      const spriteset = SceneManager._scene ? SceneManager._scene._spriteset : null;
-      if (spriteset) {
-        for (const data of this._returnData) {
-          const sprite = spriteset.findSpriteForBattler(data.battler);
-          if (sprite && sprite._animState !== ATB.AnimState.WALKING &&
-              sprite._animState !== ATB.AnimState.VICTORY) {
-            sprite.setAnimState(ATB.AnimState.WALKING);
-          }
+      // Handle telegraph timers
+      if (enemy._telegraphActive) {
+        const done = enemy.updateTelegraph();
+        if (done) {
+          // Telegraph finished — execute the skill
+          this._executeEnemyAction(enemy);
         }
+        continue;
+      }
+
+      // Check if gauge is full
+      if (!enemy.isAtbReady()) continue;
+
+      // Pick an action
+      enemy.makeActions();
+      const action = enemy.currentAction();
+      if (!action || !action.item()) {
+        enemy.resetAtbGauge();
+        continue;
+      }
+
+      // Check for cast time
+      if (enemy.startCasting(action)) {
+        continue; // Will execute when cast completes
+      }
+
+      // Check for telegraph
+      const skill = action.item();
+      const tags = ATB.parseNotetags(skill);
+      if (tags.telegraphDuration && tags.telegraphDuration > 0) {
+        const target = this._pickEnemyTarget(enemy, action);
+        const targetPoint = target ? { x: target._battleX, y: target._battleY } : null;
+        enemy.startTelegraph(skill, targetPoint);
+        enemy.resetAtbGauge();
+        continue;
+      }
+
+      // Execute immediately
+      this._executeEnemyAction(enemy);
+    }
+  };
+
+  BattleManager._executeEnemyAction = function(enemy) {
+    if (!enemy || enemy.isDead()) return;
+
+    try {
+      const action = enemy.currentAction();
+      if (!action || !action.item()) {
+        enemy.resetAtbGauge();
+        return;
+      }
+
+      // Let BattleManager handle the action through its normal pipeline
+      this._subject = enemy;
+      this.startAction();
+      enemy.resetAtbGauge();
+    } catch (e) {
+      console.warn("[ATB_EnemyRuntime] Error executing enemy action:", e);
+      enemy.resetAtbGauge();
+    }
+  };
+
+  BattleManager._pickEnemyTarget = function(enemy, action) {
+    if (!action) return null;
+    try {
+      const targets = action.makeTargets();
+      if (targets && targets.length > 0) {
+        return targets[0];
+      }
+    } catch (e) {
+      // Fall through
+    }
+    // Fallback: random alive party member
+    const alive = $gameParty.aliveMembers();
+    return alive.length > 0 ? alive[Math.floor(Math.random() * alive.length)] : null;
+  };
+
+  // ========================================================================
+  // TELEGRAPH SYSTEM — Visual warning before powerful attacks
+  // ========================================================================
+
+  Game_Enemy.prototype.startTelegraph = function(skill, targetPoint) {
+    const tags = ATB.parseNotetags(skill);
+    const duration = tags.telegraphDuration || 0;
+    if (duration <= 0) return false;
+
+    this._telegraphActive = true;
+    this._telegraphSkill = skill;
+    this._telegraphTarget = targetPoint;
+    this._telegraphTimer = Math.round(duration * 60);
+    this._telegraphTimerMax = this._telegraphTimer;
+    return true;
+  };
+
+  Game_Enemy.prototype.updateTelegraph = function() {
+    if (!this._telegraphActive) return false;
+    this._telegraphTimer--;
+    if (this._telegraphTimer <= 0) {
+      this._telegraphActive = false;
+      return true; // telegraph done → execute
+    }
+    return false; // still telegraphing
+  };
+
+  Game_Enemy.prototype.telegraphRate = function() {
+    if (!this._telegraphActive || this._telegraphTimerMax <= 0) return 0;
+    return 1.0 - (this._telegraphTimer / this._telegraphTimerMax);
+  };
+
+  // ========================================================================
+  // UPDATE HOOK — Tick wander and AI each frame
+  // ========================================================================
+
+  const _BM_update_runtime = BattleManager.update;
+  BattleManager.update = function(timeActive) {
+    _BM_update_runtime.call(this, timeActive);
+
+    if (this._phase === "battleEnd" || this._phase === "init" || this._phase === "start") return;
+
+    // Update idle wander for all enemies
+    for (const enemy of $gameTroop.aliveMembers()) {
+      if (enemy && enemy.updateIdleWander) {
+        enemy.updateIdleWander();
       }
     }
 
-    if (allDone) {
-      // Brief pause at entry position, then end battle
-      if (this._postBattlePhase === "returning") {
-        this._postBattlePhase = "pause";
-        this._postBattleTimer = 0;
-      } else if (this._postBattlePhase === "pause") {
-        if (this._postBattleTimer >= 30) { // 0.5s pause
-          this._postBattleReturning = false;
-          this._postBattlePhase = "done";
-
-          // Set victory poses
-          const spriteset = SceneManager._scene ? SceneManager._scene._spriteset : null;
-          if (spriteset) {
-            for (const data of this._returnData) {
-              const sprite = spriteset.findSpriteForBattler(data.battler);
-              if (sprite) sprite.setAnimState(ATB.AnimState.VICTORY);
-            }
-          }
-
-          // Now actually process victory
-          _BM_processVictory.call(this);
-        }
-      }
-    }
+    this._updateEnemyAI();
   };
 
-  // Also handle defeat/abort cases (no return animation needed)
-  const _BM_processDefeat = BattleManager.processDefeat;
-  BattleManager.processDefeat = function() {
-    this._postBattleReturning = false;
-    _BM_processDefeat.call(this);
-  };
-
-  const _BM_processAbort = BattleManager.processAbort;
-  BattleManager.processAbort = function() {
-    this._postBattleReturning = false;
-    _BM_processAbort.call(this);
-  };
-
-  console.log("[ATB_Movement] v3.0 — Idle wander, no chasing, post-battle return loaded.");
+  console.log("[ATB_EnemyRuntime] v3.0 — Idle wander + action-only AI loaded.");
 })();

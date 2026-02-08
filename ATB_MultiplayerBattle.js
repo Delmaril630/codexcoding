@@ -4,9 +4,8 @@
  * @author Claude / Nate
  * @orderAfter ATB_Core
  * @orderAfter ATB_SpriteExtension
- * @orderAfter ATB_Movement
+ * @orderAfter ATB_EnemyRuntime
  * @orderAfter ATB_SpatialSkills
- * @orderAfter ATB_EnemyAI
  * @orderAfter ATB_BattleUI
  *
  * @param POSITION_SYNC_RATE
@@ -259,6 +258,7 @@
       isItem: action.isItem(),
       position: { x: actor._battleX, y: actor._battleY },
       atbGauge: actor._atbGauge,
+      tpbChargeTime: actor._tpbChargeTime,
       timestamp: Date.now()
     };
 
@@ -277,6 +277,7 @@
       x: actor._battleX,
       y: actor._battleY,
       atbGauge: actor._atbGauge,
+      tpbChargeTime: actor._tpbChargeTime,
       moving: actor._atbMoving
     }]);
   };
@@ -289,7 +290,8 @@
       actorIndex: $gameParty.battleMembers().indexOf(actor),
       x: actor._battleX,
       y: actor._battleY,
-      atbGauge: actor._atbGauge
+      atbGauge: actor._atbGauge,
+      tpbChargeTime: actor._tpbChargeTime
     }]);
   };
 
@@ -299,7 +301,8 @@
 
     publish('btl/guard', [{
       actorIndex: $gameParty.battleMembers().indexOf(actor),
-      atbGauge: actor._atbGauge
+      atbGauge: actor._atbGauge,
+      tpbChargeTime: actor._tpbChargeTime
     }]);
   };
 
@@ -325,12 +328,12 @@
       mp: localActor.mp,
       tp: localActor.tp,
       atbGauge: localActor._atbGauge,
+      tpbChargeTime: localActor._tpbChargeTime,
       x: localActor._battleX,
       y: localActor._battleY,
       states: localActor._states.slice(),
       casting: localActor._atbCasting,
-      guarding: localActor._atbGuarding,
-      escaping: localActor._atbEscaping,
+      guarding: localActor._isGuarding,
       dead: localActor.isDead()
     }]);
   };
@@ -361,7 +364,26 @@
 
     // Queue for execution
     actor._actions = [action];
-    BattleManager.atbQueueAction(actor);
+    BattleManager.queueAtbAction(actor, action);
+  };
+
+  MultiSync._applyGaugeState = function(actor, data) {
+    if (!actor || !data) return;
+    if (typeof data.tpbChargeTime === 'number') {
+      actor._tpbChargeTime = Math.max(0, Math.min(1, data.tpbChargeTime));
+      if (actor._syncAtbGaugeFromTpb) {
+        actor._syncAtbGaugeFromTpb();
+      } else {
+        actor._atbGauge = Math.round(ATB.MAX_ATB_GAUGE * actor._tpbChargeTime);
+      }
+      return;
+    }
+    if (typeof data.atbGauge === 'number') {
+      actor._atbGauge = data.atbGauge;
+      if (typeof actor._tpbChargeTime === 'number') {
+        actor._tpbChargeTime = Math.max(0, Math.min(1, actor._atbGauge / ATB.MAX_ATB_GAUGE));
+      }
+    }
   };
 
   MultiSync._onPeerMove = function(from, data) {
@@ -376,7 +398,7 @@
     // Smoothly interpolate to peer's position
     actor._atbTargetX = data.x;
     actor._atbTargetY = data.y;
-    actor._atbGauge = data.atbGauge;
+    this._applyGaugeState(actor, data);
     actor._atbMoving = data.moving;
   };
 
@@ -396,7 +418,11 @@
     // If server says our gauge isn't ready, correct it
     if (data.correctedGauge !== undefined) {
       const actor = $gameParty.battleMembers()[this._localActorIndex];
-      if (actor) actor._atbGauge = data.correctedGauge;
+      if (actor) this._applyGaugeState(actor, { atbGauge: data.correctedGauge });
+    }
+    if (data.correctedCharge !== undefined) {
+      const actor = $gameParty.battleMembers()[this._localActorIndex];
+      if (actor) this._applyGaugeState(actor, { tpbChargeTime: data.correctedCharge });
     }
   };
 
@@ -411,7 +437,7 @@
 
     if (data.hp !== undefined) actor._hp = data.hp;
     if (data.mp !== undefined) actor._mp = data.mp;
-    if (data.atbGauge !== undefined) actor._atbGauge = data.atbGauge;
+    this._applyGaugeState(actor, data);
     if (data.x !== undefined) actor._battleX = data.x;
     if (data.y !== undefined) actor._battleY = data.y;
     if (data.dead && !actor.isDead()) actor.die();
@@ -701,12 +727,14 @@
   };
 
   // Hook into escape for network
-  const _BM_startAtbEscape_mp = BattleManager.startAtbEscape;
-  BattleManager.startAtbEscape = function() {
-    _BM_startAtbEscape_mp.call(this);
-    const actor = $gameParty.battleMembers()[MultiSync._localActorIndex];
-    if (actor) MultiSync.sendEscape(actor);
-  };
+  if (BattleManager.startAtbEscape) {
+    const _BM_startAtbEscape_mp = BattleManager.startAtbEscape;
+    BattleManager.startAtbEscape = function() {
+      _BM_startAtbEscape_mp.call(this);
+      const actor = $gameParty.battleMembers()[MultiSync._localActorIndex];
+      if (actor) MultiSync.sendEscape(actor);
+    };
+  }
 
   // Hook into movement end
   const _GB_stopMovement_mp = Game_Battler.prototype.stopMovement;
@@ -730,7 +758,7 @@
     if (MultiSync._active) {
       for (const actor of $gameParty.battleMembers()) {
         if (MultiSync.isAITakeover(actor) && actor.isAtbReady()) {
-          if (!actor._atbCasting && !actor._atbGuarding && !actor._atbMoving) {
+          if (!actor._atbCasting && !actor._isGuarding && !actor._atbMoving) {
             // Simple AI: attack nearest enemy
             const action = new Game_Action(actor);
             action.setAttack();
@@ -738,7 +766,7 @@
             if (enemies.length > 0) {
               action._targetIndex = 0;
               actor._actions = [action];
-              BattleManager.atbQueueAction(actor);
+              BattleManager.queueAtbAction(actor, action);
             }
           }
         }
