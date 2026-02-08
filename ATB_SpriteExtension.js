@@ -176,6 +176,15 @@
       this._animFrame = 0;
       this._animTimer = 0;
       this._animCallback = callback || null;
+      if (this._battler) {
+        const movingStates = new Set([
+          AnimState.RUSHING,
+          AnimState.RETURNING,
+          AnimState.PASSTHROUGH,
+          AnimState.PIERCING,
+        ]);
+        this._battler._atbMoving = movingStates.has(state);
+      }
     }
 
     update() {

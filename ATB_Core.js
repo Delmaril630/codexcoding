@@ -105,18 +105,22 @@
  * <PierceWidth: N>    — Width of pierce hitbox (default: 60)
  * <CastTime: N>       — Cast time in seconds
  * <Interruptible: true|false>
+ * <TelegraphDuration: N> — Telegraph duration in seconds (enemy warning)
+ * <AoEOrigin: caster|target> — Center AoE on caster or the primary target
+ * <AoEApply: true|false> — Apply AoE to targets (default: true when AoE tags exist)
+ * <AoEWidth: N>      — Width in px for LINE AoE
+ * <AoELength: N>     — Length in px for LINE AoE
+ * <AoEAngle: N>      — Full angle in degrees for CONE AoE
  *
  * == EQUIPMENT NOTETAGS ==
  * <ATBSpeedBonus: +N%>
  * <ATBSpeedMod: N%>
- * <MoveDrainMod: N%>
- * <StrikeRange: +N>
  * <Knockback: N>
  * <Pull: N>
  *
  * == STATE NOTETAGS ==
  * <ATBSpeedMod: N%>
- * <MoveDrainMod: N%>
+ * <ATBFreeze: true|false>
  *
  * == ENEMY NOTETAGS ==
  * <BattleCharSheet: filename>
@@ -208,6 +212,9 @@
     const intr = b(/<Interruptible:\s*(true|false)>/i);
     if (intr !== undefined) t.interruptible = intr;
 
+    const td = f(/<TelegraphDuration:\s*([\d.]+)>/i);
+    if (td !== undefined) t.telegraphDuration = td;
+
     // ---- Equipment / State modifiers ----
     const spd = pct(/<ATBSpeedBonus:\s*\+?(\d+)%>/i);
     if (spd !== undefined) t.atbSpeedBonus = spd;
@@ -215,17 +222,29 @@
     const smod = pct(/<ATBSpeedMod:\s*(\d+)%>/i);
     if (smod !== undefined) t.atbSpeedMod = smod;
 
-    const mdm = pct(/<MoveDrainMod:\s*(\d+)%>/i);
-    if (mdm !== undefined) t.moveDrainMod = mdm;
-
-    const sr = i(/<StrikeRange:\s*\+?(\d+)>/i);
-    if (sr !== undefined) t.strikeRange = sr;
-
     const kb = i(/<Knockback:\s*(\d+)>/i);
     if (kb !== undefined) t.knockback = kb;
 
     const pl = i(/<Pull:\s*(\d+)>/i);
     if (pl !== undefined) t.pull = pl;
+
+    const aoeOrigin = s(/<AoEOrigin:\s*(caster|target)>/i);
+    if (aoeOrigin !== undefined) t.aoeOrigin = aoeOrigin.toLowerCase();
+
+    const aoeApply = b(/<AoEApply:\s*(true|false)>/i);
+    if (aoeApply !== undefined) t.aoeApply = aoeApply;
+
+    const aoeWidth = i(/<AoEWidth:\s*(\d+)>/i);
+    if (aoeWidth !== undefined) t.aoeWidth = aoeWidth;
+
+    const aoeLength = i(/<AoELength:\s*(\d+)>/i);
+    if (aoeLength !== undefined) t.aoeLength = aoeLength;
+
+    const aoeAngle = f(/<AoEAngle:\s*([\d.]+)>/i);
+    if (aoeAngle !== undefined) t.aoeAngle = aoeAngle;
+
+    const frz = b(/<ATBFreeze:\s*(true|false)>/i);
+    if (frz !== undefined) t.atbFreeze = frz;
 
     // ---- AoE (kept for future use) ----
     const aoeMatch = n.match(/<SkillAoE:\s*(\w+)(?:\s*,\s*(\d+))?(?:\s*,\s*(\d+))?(?:\s*,\s*(\d+))?>/i);
@@ -378,23 +397,25 @@
     return mod;
   };
 
-  ATB.getEquipMoveDrainMod = function(battler) {
-    if (!battler || !battler.isActor || !battler.isActor()) return 1.0;
-    let mod = 1.0;
-    for (const eq of battler.equips()) {
-      if (eq) { const tg = ATB.parseNotetags(eq); if (tg.moveDrainMod) mod *= tg.moveDrainMod; }
-    }
-    return mod;
-  };
-
-  ATB.getStateMoveDrainMod = function(battler) {
-    if (!battler || !battler.states) return 1.0;
-    let mod = 1.0;
+  ATB.isAtbFrozen = function(battler) {
+    if (!battler || !battler.states) return false;
+    let hasNoFreezeTag = false;
     for (const state of battler.states()) {
       const tg = ATB.parseNotetags(state);
-      if (tg.moveDrainMod) mod *= tg.moveDrainMod;
+      if (tg.atbFreeze === true) return true;
+      if (tg.atbFreeze === false) hasNoFreezeTag = true;
     }
-    return mod;
+    if (hasNoFreezeTag) return false;
+    return !battler.canMove();
+  };
+
+  ATB.hasAtbFreezeOverride = function(battler) {
+    if (!battler || !battler.states) return false;
+    for (const state of battler.states()) {
+      const tg = ATB.parseNotetags(state);
+      if (tg.atbFreeze === false) return true;
+    }
+    return false;
   };
 
   // ========================================================================
@@ -449,6 +470,7 @@
     this._atbCastTimer = 0;
     this._atbCastAction = null;
     this._isGuarding = false;
+    this._atbMoving = false;
   };
 
   Game_BattlerBase.prototype.setBattlePosition = function(x, y) {
@@ -489,7 +511,8 @@
    * Per-frame ATB update. Called from the battle update loop.
    */
   Game_Battler.prototype.updateAtbGauge = function() {
-    if (this.isDead() || !this.canMove()) return;
+    if (this.isDead()) return;
+    if (ATB.isAtbFrozen(this)) return;
 
     // Casting?
     if (this._atbCasting) {
@@ -502,24 +525,26 @@
           this._atbCastAction = null;
         }
       }
+      this._syncAtbGaugeFromTpb();
       return;
     }
 
-    // Fill gauge
-    const fillAmount = (ATB.MAX_ATB_GAUGE / 300) * this.atbFillRate(); // ~300 frames at AGI=REF
-    this._atbGauge = Math.min(ATB.MAX_ATB_GAUGE, this._atbGauge + fillAmount);
-
-    // Sync to MZ's TPB system so the built-in gauge display works
-    this._tpbChargeTime = this._atbGauge / ATB.MAX_ATB_GAUGE;
+    // Sync cached ATB gauge from TPB for UI and multiplayer payloads
+    this._syncAtbGaugeFromTpb();
   };
 
   Game_Battler.prototype.isAtbReady = function() {
-    return this._atbGauge >= ATB.MAX_ATB_GAUGE && !this._atbCasting;
+    return this.isTpbCharged() && !this._atbCasting;
   };
 
   Game_Battler.prototype.resetAtbGauge = function() {
+    this.clearTpbChargeTime();
     this._atbGauge = 0;
-    this._tpbChargeTime = 0;
+  };
+
+  Game_Battler.prototype._syncAtbGaugeFromTpb = function() {
+    const charge = this._tpbChargeTime || 0;
+    this._atbGauge = Math.round(ATB.MAX_ATB_GAUGE * charge);
   };
 
   Game_Battler.prototype.startCasting = function(action) {
@@ -543,8 +568,29 @@
 
     this._atbCasting = false;
     this._atbCastAction = null;
-    this._atbGauge = ATB.MAX_ATB_GAUGE * ATB.INTERRUPT_GAUGE_REFUND;
-    this._tpbChargeTime = this._atbGauge / ATB.MAX_ATB_GAUGE;
+    this._tpbState = "charging";
+    this._tpbChargeTime = ATB.INTERRUPT_GAUGE_REFUND;
+    this._syncAtbGaugeFromTpb();
+  };
+
+  const _GB_updateTpb = Game_Battler.prototype.updateTpb;
+  Game_Battler.prototype.updateTpb = function() {
+    if (ATB.isAtbFrozen(this)) {
+      this._syncAtbGaugeFromTpb();
+      return;
+    }
+    if (ATB.hasAtbFreezeOverride(this) && !this.canMove()) {
+      this.updateTpbChargeTime();
+      this.updateTpbCastTime();
+      this.updateTpbAutoBattle();
+      if (this.isAlive()) {
+        this.updateTpbIdleTime();
+      }
+      this._syncAtbGaugeFromTpb();
+      return;
+    }
+    _GB_updateTpb.call(this);
+    this._syncAtbGaugeFromTpb();
   };
 
   // ========================================================================
@@ -568,6 +614,17 @@
     return value;
   };
 
+  // Track guarding state from actions
+  const _BM_startAction_guard = BattleManager.startAction;
+  BattleManager.startAction = function() {
+    const subject = this._subject;
+    const action = subject ? subject.currentAction() : null;
+    if (subject && action) {
+      subject._isGuarding = action.isGuard();
+    }
+    _BM_startAction_guard.call(this);
+  };
+
   // ========================================================================
   // ACTION QUEUE — Continuous ATB (replaces MZ turn-based phases)
   // ========================================================================
@@ -585,6 +642,18 @@
 
   BattleManager.dequeueAtbAction = function() {
     return this._atbActionQueue.shift() || null;
+  };
+
+  BattleManager.processAtbActions = function() {
+    const next = this.dequeueAtbAction();
+    if (!next) return;
+    const { battler, action } = next;
+    if (!battler || battler.isDead() || !action) return;
+    battler._actions = [action];
+    battler.startTpbAction();
+    if (!this._actionBattlers.includes(battler)) {
+      this._actionBattlers.push(battler);
+    }
   };
 
   // ========================================================================
@@ -628,7 +697,7 @@
       member.setBattlePosition(px, py);
       member.setHomePosition(px, py);
       member.setEntryPosition(px, py);
-      member.resetAtbGauge();
+      member._syncAtbGaugeFromTpb();
       member._isGuarding = false;
     }
 
@@ -651,7 +720,7 @@
       enemy.setBattlePosition(ex, ey);
       enemy.setHomePosition(ex, ey);
       enemy.setEntryPosition(ex, ey);
-      enemy.resetAtbGauge();
+      enemy._syncAtbGaugeFromTpb();
     }
   };
 
@@ -671,6 +740,8 @@
     if (this._phase !== "battleEnd") {
       this.updateAllAtbGauges();
     }
+
+    this.processAtbActions();
 
     _BM_update.call(this, timeActive);
   };

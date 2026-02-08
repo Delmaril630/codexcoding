@@ -260,6 +260,17 @@ function handleAction(ws, battle, player, data, channel) {
   const { userId } = ws;
   const now = Date.now();
 
+  // --- Validate actor ownership ---
+  if (typeof data.actorIndex !== 'number' || data.actorIndex !== player.actorIndex) {
+    logger.security('Battle action actor mismatch', {
+      userId,
+      actorIndex: data.actorIndex,
+      expected: player.actorIndex
+    });
+    sendToPlayer(ws, 'btl/rejected', [{ timestamp: data.timestamp, reason: 'actor_mismatch' }]);
+    return 'handled';
+  }
+
   // --- Rate limit: can't act faster than ATB allows ---
   if (now - player.lastActionTime < ACTION_COOLDOWN_MS) {
     logger.security('Battle action rate limited', { userId, delta: now - player.lastActionTime });
@@ -267,13 +278,6 @@ function handleAction(ws, battle, player, data, channel) {
       timestamp: data.timestamp,
       reason: 'action_too_fast'
     }]);
-    return 'handled';
-  }
-
-  // --- Validate actor index ---
-  if (typeof data.actorIndex !== 'number' || data.actorIndex < 0 || data.actorIndex > 7) {
-    logger.security('Battle invalid actor index', { userId, actorIndex: data.actorIndex });
-    sendToPlayer(ws, 'btl/rejected', [{ timestamp: data.timestamp, reason: 'invalid_actor' }]);
     return 'handled';
   }
 
@@ -309,6 +313,12 @@ function handleAction(ws, battle, player, data, channel) {
     return 'handled';
   }
 
+  if (!Array.isArray(data.targetIndices)) {
+    logger.security('Battle invalid target indices', { userId });
+    sendToPlayer(ws, 'btl/rejected', [{ timestamp: data.timestamp, reason: 'invalid_targets' }]);
+    return 'handled';
+  }
+
   // --- Passed validation ---
   player.lastActionTime = now;
   player.lastAtbGauge = 0; // Gauge should be spent
@@ -329,6 +339,15 @@ function handleAction(ws, battle, player, data, channel) {
 
 function handleMove(ws, battle, player, data, channel) {
   const { userId } = ws;
+
+  if (typeof data.actorIndex !== 'number' || data.actorIndex !== player.actorIndex) {
+    logger.security('Battle move actor mismatch', {
+      userId,
+      actorIndex: data.actorIndex,
+      expected: player.actorIndex
+    });
+    return 'handled';
+  }
 
   // Validate position bounds
   const bw = battle.settings.width;
@@ -374,6 +393,15 @@ function handleMove(ws, battle, player, data, channel) {
 function handleMoveEnd(ws, battle, player, data, channel) {
   const { userId } = ws;
 
+  if (typeof data.actorIndex !== 'number' || data.actorIndex !== player.actorIndex) {
+    logger.security('Battle move_end actor mismatch', {
+      userId,
+      actorIndex: data.actorIndex,
+      expected: player.actorIndex
+    });
+    return 'handled';
+  }
+
   // Update position
   if (typeof data.x === 'number') player.lastPosition.x = data.x;
   if (typeof data.y === 'number') player.lastPosition.y = data.y;
@@ -395,6 +423,16 @@ function handleMoveEnd(ws, battle, player, data, channel) {
 function handleGuard(ws, battle, player, data, channel) {
   const { userId } = ws;
 
+  if (typeof data.actorIndex !== 'number' || data.actorIndex !== player.actorIndex) {
+    logger.security('Battle guard actor mismatch', {
+      userId,
+      actorIndex: data.actorIndex,
+      expected: player.actorIndex
+    });
+    sendToPlayer(ws, 'btl/rejected', [{ reason: 'actor_mismatch' }]);
+    return 'handled';
+  }
+
   // Validate gauge
   if (typeof data.atbGauge === 'number' && data.atbGauge < MAX_ATB_GAUGE * 0.9) {
     sendToPlayer(ws, 'btl/rejected', [{ reason: 'gauge_not_full_guard' }]);
@@ -412,6 +450,14 @@ function handleGuard(ws, battle, player, data, channel) {
 
 function handleEscape(ws, battle, player, data, channel) {
   const { userId } = ws;
+  if (typeof data.actorIndex !== 'number' || data.actorIndex !== player.actorIndex) {
+    logger.security('Battle escape actor mismatch', {
+      userId,
+      actorIndex: data.actorIndex,
+      expected: player.actorIndex
+    });
+    return 'handled';
+  }
   // Escape is valid any time — broadcast to peers
   broadcastToBattle(channel, userId, 'btl/peer_act', [{
     actorIndex: data.actorIndex,
@@ -425,13 +471,52 @@ function handleState(ws, battle, player, data, channel) {
   // Periodic state snapshot — store for reconciliation
   const { userId } = ws;
 
-  if (typeof data.atbGauge === 'number') player.lastAtbGauge = data.atbGauge;
-  if (data.x !== undefined) player.lastPosition.x = data.x;
-  if (data.y !== undefined) player.lastPosition.y = data.y;
+  if (typeof data.actorIndex !== 'number' || data.actorIndex !== player.actorIndex) {
+    logger.security('Battle state actor mismatch', {
+      userId,
+      actorIndex: data.actorIndex,
+      expected: player.actorIndex
+    });
+    return 'handled';
+  }
+
+  const sanitized = {
+    actorIndex: data.actorIndex
+  };
+
+  if (typeof data.atbGauge === 'number') {
+    sanitized.atbGauge = Math.max(0, Math.min(MAX_ATB_GAUGE, data.atbGauge));
+    player.lastAtbGauge = sanitized.atbGauge;
+  }
+
+  if (typeof data.x === 'number') {
+    const bw = battle.settings.width;
+    sanitized.x = Math.max(0, Math.min(bw, data.x));
+    player.lastPosition.x = sanitized.x;
+  }
+
+  if (typeof data.y === 'number') {
+    const bh = battle.settings.height;
+    sanitized.y = Math.max(0, Math.min(bh, data.y));
+    player.lastPosition.y = sanitized.y;
+  }
+
+  if (Array.isArray(data.states)) {
+    sanitized.states = data.states.slice(0, 32);
+  }
+
+  if (typeof data.hp === 'number') sanitized.hp = Math.max(0, data.hp);
+  if (typeof data.mp === 'number') sanitized.mp = Math.max(0, data.mp);
+  if (typeof data.tp === 'number') sanitized.tp = Math.max(0, data.tp);
+  if (typeof data.casting === 'boolean') sanitized.casting = data.casting;
+  if (typeof data.guarding === 'boolean') sanitized.guarding = data.guarding;
+  if (typeof data.escaping === 'boolean') sanitized.escaping = data.escaping;
+  if (typeof data.dead === 'boolean') sanitized.dead = data.dead;
+
   player.lastStateSync = Date.now();
 
   // Relay to peers so they can reconcile
-  broadcastToBattle(channel, userId, 'btl/sync', [data]);
+  broadcastToBattle(channel, userId, 'btl/sync', [sanitized]);
 
   return 'handled';
 }

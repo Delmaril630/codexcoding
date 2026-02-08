@@ -2,7 +2,7 @@
  * @target MZ
  * @plugindesc [ATB v3.0] Spatial Skills — Full screen range, no restrictions
  * @author Hyaku no Sekai
- * @orderAfter ATB_EnemyAI
+ * @orderAfter ATB_EnemyRuntime
  *
  * @help
  * ============================================================================
@@ -17,6 +17,16 @@
  * do NOT restrict targeting.
  *
  * Pierce line-hit detection is handled by ATB_SpriteExtension.
+ *
+ * == AOE TAGS ==
+ * <SkillAoE: CIRCLE, radius>
+ * <SkillAoE: LINE, length, width>
+ * <SkillAoE: CONE, radius, angle>
+ * <AoEOrigin: caster|target>
+ * <AoEApply: true|false>
+ * <AoEWidth: N>
+ * <AoELength: N>
+ * <AoEAngle: N>
  */
 
 (() => {
@@ -42,7 +52,7 @@
   // ========================================================================
 
   /**
-   * Get AoE shape info for a skill. Used by visual effects, NOT by targeting.
+   * Get AoE shape info for a skill. Target expansion is optional via AoEApply.
    */
   ATB.getSkillAoE = function(skill) {
     if (!skill) return { type: "SINGLE" };
@@ -51,11 +61,83 @@
       return {
         type: tags.aoeShape,
         radius: tags.aoeRadius || 80,
-        length: tags.aoeLength || 0,
+        length: tags.aoeLength || tags.aoeRadius || 0,
+        width: tags.aoeWidth || tags.aoeAngle || ATB.PIERCE_DEFAULT_WIDTH,
         angle:  tags.aoeAngle  || 0,
+        origin: tags.aoeOrigin || "caster",
+        applyTargets: tags.aoeApply !== false,
       };
     }
     return { type: "SINGLE" };
+  };
+
+  ATB.getAoEOriginPoint = function(action, baseTargets, origin) {
+    const subject = action.subject();
+    if (origin === "target" && baseTargets && baseTargets[0]) {
+      const t = baseTargets[0];
+      return { x: t._battleX || 0, y: t._battleY || 0 };
+    }
+    return { x: subject._battleX || 0, y: subject._battleY || 0 };
+  };
+
+  ATB.getAoEDirectionAngle = function(origin, baseTargets) {
+    if (!baseTargets || !baseTargets[0]) return null;
+    const t = baseTargets[0];
+    const dx = (t._battleX || 0) - origin.x;
+    const dy = (t._battleY || 0) - origin.y;
+    if (dx === 0 && dy === 0) return null;
+    return (Math.atan2(dy, dx) * 180) / Math.PI;
+  };
+
+  ATB.getAoETargets = function(action, baseTargets) {
+    const item = action.item();
+    if (!item) return baseTargets;
+    const aoe = ATB.getSkillAoE(item);
+    if (!aoe || aoe.type === "SINGLE") return baseTargets;
+
+    const subject = action.subject();
+    if (!subject) return baseTargets;
+    const team = action.isForOpponent()
+      ? (subject.isActor() ? "enemy" : "party")
+      : (subject.isActor() ? "party" : "enemy");
+
+    const origin = ATB.getAoEOriginPoint(action, baseTargets, aoe.origin);
+
+    if (aoe.type === "CIRCLE") {
+      return ATB.getBattlersInRadius(origin.x, origin.y, aoe.radius, team);
+    }
+
+    if (aoe.type === "LINE") {
+      const dir = ATB.getAoEDirectionAngle(origin, baseTargets);
+      if (dir === null) return baseTargets;
+      const rad = (dir * Math.PI) / 180;
+      const x2 = origin.x + Math.cos(rad) * aoe.length;
+      const y2 = origin.y + Math.sin(rad) * aoe.length;
+      return ATB.getBattlersInLine(origin.x, origin.y, x2, y2, aoe.width, team);
+    }
+
+    if (aoe.type === "CONE") {
+      const dir = ATB.getAoEDirectionAngle(origin, baseTargets);
+      if (dir === null) return baseTargets;
+      const angle = aoe.angle || 60;
+      return ATB.getBattlersInCone(origin.x, origin.y, dir, angle / 2, aoe.radius, team);
+    }
+
+    return baseTargets;
+  };
+
+  // ========================================================================
+  // AOE TARGET EXPANSION — Preserve default behavior when no tags present
+  // ========================================================================
+
+  const _GA_makeTargets = Game_Action.prototype.makeTargets;
+  Game_Action.prototype.makeTargets = function() {
+    const targets = _GA_makeTargets.call(this);
+    const item = this.item();
+    if (!item) return targets;
+    const aoe = ATB.getSkillAoE(item);
+    if (!aoe || aoe.type === "SINGLE" || aoe.applyTargets === false) return targets;
+    return ATB.getAoETargets(this, targets);
   };
 
   /**
