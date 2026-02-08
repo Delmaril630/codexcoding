@@ -175,6 +175,40 @@
   window.ATB = ATB;
 
   // ========================================================================
+  // BATTLEFIELD POSITION HELPERS
+  // ========================================================================
+  ATB._clampToBattlefield = function(x, y) {
+    const pad = ATB.EDGE_PADDING;
+    const w = ATB._currentBattleWidth || Graphics.width;
+    const h = ATB._currentBattleHeight || Graphics.height;
+    const cx = Math.min(Math.max(x, pad), w - pad);
+    const cy = Math.min(Math.max(y, pad), h - pad);
+    return { x: cx, y: cy };
+  };
+
+  ATB.getPartyMapPositions = function() {
+    if (!$gamePlayer || !$gameMap) return [];
+    const positions = [];
+    const leaderX = $gamePlayer.screenX?.() ?? null;
+    const leaderY = $gamePlayer.screenY?.() ?? null;
+    if (leaderX !== null && leaderY !== null) {
+      positions[0] = ATB._clampToBattlefield(leaderX, leaderY);
+    }
+    if ($gamePlayer.followers && $gamePlayer.followers()) {
+      const followers = $gamePlayer.followers().visibleFollowers();
+      for (let i = 0; i < followers.length; i++) {
+        const follower = followers[i];
+        const fx = follower.screenX?.() ?? null;
+        const fy = follower.screenY?.() ?? null;
+        if (fx !== null && fy !== null) {
+          positions[i + 1] = ATB._clampToBattlefield(fx, fy);
+        }
+      }
+    }
+    return positions;
+  };
+
+  // ========================================================================
   // NOTETAG PARSER
   // ========================================================================
   const _noteCache = new Map();
@@ -614,17 +648,6 @@
     return value;
   };
 
-  // Track guarding state from actions
-  const _BM_startAction_guard = BattleManager.startAction;
-  BattleManager.startAction = function() {
-    const subject = this._subject;
-    const action = subject ? subject.currentAction() : null;
-    if (subject && action) {
-      subject._isGuarding = action.isGuard();
-    }
-    _BM_startAction_guard.call(this);
-  };
-
   // ========================================================================
   // ACTION QUEUE — Continuous ATB (replaces MZ turn-based phases)
   // ========================================================================
@@ -677,6 +700,7 @@
     // Check troop notetags for custom positions
     const troop = $dataTroops[$gameTroop._troopId];
     const troopTags = troop ? ATB.parseNotetags(troop) : {};
+    const mapPositions = ATB.getPartyMapPositions();
 
     // ---- Party (left side of screen) ----
     const party = $gameParty.battleMembers();
@@ -690,6 +714,9 @@
       if (troopTags.partyPositions && troopTags.partyPositions[i]) {
         px = troopTags.partyPositions[i].x;
         py = troopTags.partyPositions[i].y;
+      } else if (mapPositions[i]) {
+        px = mapPositions[i].x;
+        py = mapPositions[i].y;
       } else {
         px = partyStartX;
         py = partyStartY + i * partySpacing;
