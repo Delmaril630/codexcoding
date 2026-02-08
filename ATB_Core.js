@@ -648,6 +648,23 @@
     return value;
   };
 
+  // Track guarding state from actions
+  const _BM_startAction_guard = BattleManager.startAction;
+  BattleManager.startAction = function() {
+    const subject = this._subject;
+    const action = subject ? subject.currentAction() : null;
+    if (subject && action) {
+      subject._isGuarding = action.isGuard();
+    }
+    _BM_startAction_guard.call(this);
+  };
+
+  const _GB_onAllActionsEnd_guard = Game_Battler.prototype.onAllActionsEnd;
+  Game_Battler.prototype.onAllActionsEnd = function() {
+    _GB_onAllActionsEnd_guard.call(this);
+    this._isGuarding = false;
+  };
+
   // ========================================================================
   // ACTION QUEUE — Continuous ATB (replaces MZ turn-based phases)
   // ========================================================================
