@@ -586,10 +586,16 @@ function handleSendto(ws, msg) {
   }
 
   // Find target connection
+  const numericTarget = Number(targetUser);
   let targetConn = global.connections?.get(targetUser);
+  if (!targetConn && Number.isFinite(numericTarget)) {
+    targetConn = global.connections?.get(numericTarget);
+  }
   if (!targetConn && global.connections) {
+    const normalizedTarget = String(targetUser ?? '').trim().toLowerCase();
     for (const conn of global.connections.values()) {
-      if (conn?.username && conn.username === targetUser) {
+      const username = conn?.username;
+      if (username && String(username).trim().toLowerCase() === normalizedTarget) {
         targetConn = conn;
         break;
       }
